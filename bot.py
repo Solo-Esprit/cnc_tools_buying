@@ -31,7 +31,7 @@ logging.basicConfig(
     level=logging.INFO
 )
 
-# === ФУНКЦИИ РАБОТЫ С ТАБЛИЦЕЙ ===
+# === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ===
 def get_worksheet(chat_id: int):
     try:
         return sheet.worksheet(str(chat_id))
@@ -105,12 +105,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 await query.edit_message_text("Позиция не найдена.")
         except Exception as e:
-            logging.error("Ошибка: %s", e)
-            await query.edit_message_text("Ошибка удаления.")
+            logging.error("Ошибка удаления: %s", e)
+            await query.edit_message_text("Ошибка при удалении.")
 
 # === ГЛАВНАЯ ФУНКЦИЯ ===
 def main():
-    # Создаём Application один раз
+    # Создаём Application
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("add", add_item))
@@ -118,33 +118,40 @@ def main():
     app.add_handler(CommandHandler("clear", clear_list))
     app.add_handler(CallbackQueryHandler(button_handler))
 
-    # Запускаем Application в фоне (без polling!)
-    app.post_init = lambda *_: logging.info("Application initialized")
-    app.updater = None  # отключаем updater, так как используем webhook
-    app._running = True
-    import asyncio
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+    # Получаем ID бота (до двоеточия)
+    BOT_ID = TOKEN.split(':')[0]
+    WEBHOOK_PATH = f"/webhook-{BOT_ID}"
 
-    # Устанавливаем webhook
-    webhook_url = f"https://{os.environ['RENDER_EXTERNAL_HOSTNAME']}/{TOKEN}"
-    loop.run_until_complete(app.bot.set_webhook(url=webhook_url))
-    logging.info(f"✅ Webhook установлен: {webhook_url}")
-
-    # Flask-сервер
+    # Flask-приложение
     flask_app = Flask(__name__)
 
-    @flask_app.route(f"/{TOKEN}", methods=["POST"])
+    @flask_app.route(WEBHOOK_PATH, methods=["POST"])
     def telegram_webhook():
-        # Получаем JSON от Telegram
-        update = Update.de_json(request.get_json(force=True), app.bot)
-        # Обрабатываем асинхронно
-        loop.create_task(app.process_update(update))
+        json_data = request.get_json()
+        if json_data is None:
+            logging.warning("Получен пустой JSON от Telegram")
+            return "OK"
+        try:
+            update = Update.de_json(json_data, app.bot)
+            import asyncio
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(app.process_update(update))
+        except Exception as e:
+            logging.error("Ошибка обработки обновления: %s", e)
         return "OK"
 
     @flask_app.route("/")
     def hello():
         return "🛒 Telegram Purchase Bot is running!"
+
+    # Устанавливаем webhook
+    import asyncio
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    webhook_url = f"https://{os.environ['RENDER_EXTERNAL_HOSTNAME']}{WEBHOOK_PATH}"
+    loop.run_until_complete(app.bot.set_webhook(url=webhook_url))
+    logging.info(f"✅ Webhook установлен: {webhook_url}")
 
     # Запускаем Flask
     flask_app.run(host="0.0.0.0", port=PORT)
