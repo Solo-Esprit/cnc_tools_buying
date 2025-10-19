@@ -13,6 +13,7 @@ import json
 from flask import Flask, request
 import asyncio
 import threading
+import queue
 
 # === НАСТРОЙКИ ===
 TOKEN = os.environ["TELEGRAM_TOKEN"]
@@ -113,13 +114,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logging.error("Ошибка удаления: %s", e)
 
-# === ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ===
-app = None
-update_queue = None
+# === МЕЖПОТОЧНАЯ ОЧЕРЕДЬ ===
+cross_thread_queue = queue.Queue()
 
-# === ФОНОВАЯ АСИНХРОННАЯ РАБОТА ===
+# === ФОНОВЫЙ TELEGRAM WORKER ===
 async def telegram_worker():
-    global app, update_queue
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("add", add_item))
@@ -129,7 +128,6 @@ async def telegram_worker():
 
     await app.initialize()
     await app.start()
-    update_queue = app.update_queue
     logging.info("✅ Telegram worker запущен")
 
     # Устанавливаем webhook
@@ -138,24 +136,27 @@ async def telegram_worker():
     await app.bot.set_webhook(url=webhook_url)
     logging.info(f"✅ Webhook установлен: {webhook_url}")
 
-    # Ждём бесконечно (worker живёт в фоне)
-    while True:
-        await asyncio.sleep(3600)
+    # Передаём app.bot в глобальную область для Flask
+    global bot_instance
+    bot_instance = app.bot
 
-# === ЗАПУСК ТЕЛЕГРАМ В ФОНЕ ===
-def start_telegram_in_background():
-    def run_async():
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(telegram_worker())
-    thread = threading.Thread(target=run_async, daemon=True)
-    thread.start()
-    # Ждём, пока инициализируется очередь
-    import time
-    while update_queue is None:
-        time.sleep(0.1)
+    # Цикл: читаем из thread-safe очереди и обрабатываем
+    while True:
+        try:
+            update = cross_thread_queue.get(timeout=1)
+            await app.process_update(update)
+        except queue.Empty:
+            continue
+        except Exception as e:
+            logging.error("Ошибка в worker: %s", e)
+
+def run_telegram_worker():
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(telegram_worker())
 
 # === FLASK ===
+bot_instance = None
 flask_app = Flask(__name__)
 
 @flask_app.route("/webhook-<bot_id>", methods=["POST"])
@@ -169,8 +170,8 @@ def telegram_webhook(bot_id):
     update_id = json_data.get("update_id", "unknown")
     logging.info("📥 Получено обновление: %s", update_id)
     try:
-        update = Update.de_json(json_data, app.bot)
-        update_queue.put_nowait(update)
+        update = Update.de_json(json_data, bot_instance)
+        cross_thread_queue.put(update)  # ✅ thread-safe!
     except Exception as e:
         logging.error("Ошибка при постановке в очередь: %s", e)
     return "OK"
@@ -182,8 +183,12 @@ def hello():
 # === MAIN ===
 def main():
     # Запускаем Telegram в фоне
-    start_telegram_in_background()
-    # Запускаем Flask в основном потоке
+    threading.Thread(target=run_telegram_worker, daemon=True).start()
+    # Ждём, пока bot_instance инициализируется
+    import time
+    while bot_instance is None:
+        time.sleep(0.1)
+    # Запускаем Flask
     flask_app.run(host="0.0.0.0", port=PORT)
 
 if __name__ == '__main__':
