@@ -16,7 +16,7 @@ from flask import Flask, request
 TOKEN = os.environ["TELEGRAM_TOKEN"]
 SHEET_ID = os.environ["GOOGLE_SHEET_ID"]
 CREDENTIALS_JSON = os.environ["GOOGLE_CREDENTIALS_JSON"]
-PORT = int(os.environ.get("PORT", 10000))  # Render задаёт PORT автоматически
+PORT = int(os.environ.get("PORT", 10000))
 
 # === GOOGLE AUTH ===
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
@@ -108,22 +108,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logging.error("Ошибка: %s", e)
             await query.edit_message_text("Ошибка удаления.")
 
-# === ЗАПУСК С WEBHOOK ===
+# === ГЛАВНАЯ ФУНКЦИЯ ===
 def main():
-    app = Application.builder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("add", add_item))
-    app.add_handler(CommandHandler("list", show_list))
-    app.add_handler(CommandHandler("clear", clear_list))
-    app.add_handler(CallbackQueryHandler(button_handler))
-
-    # Flask для обработки webhook
+    # Создаём Flask-приложение
     flask_app = Flask(__name__)
 
     @flask_app.route(f"/{TOKEN}", methods=["POST"])
-    def webhook():
-        app.update_queue.put_nowait(
-            Update.de_json(request.get_json(force=True), app.bot)
+    def telegram_webhook():
+        # Передаём обновление в очередь бота
+        flask_app.bot_app.update_queue.put_nowait(
+            Update.de_json(request.get_json(force=True), flask_app.bot_app.bot)
         )
         return "OK"
 
@@ -131,13 +125,38 @@ def main():
     def hello():
         return "Telegram Purchase Bot is running!"
 
-    # Установка webhook
-    import threading
-    webhook_url = f"https://{os.environ['RENDER_EXTERNAL_HOSTNAME']}/{TOKEN}"
-    app.bot.set_webhook(url=webhook_url)
+    # Инициализация Telegram-бота
+    bot_app = Application.builder().token(TOKEN).build()
+    bot_app.add_handler(CommandHandler("start", start))
+    bot_app.add_handler(CommandHandler("add", add_item))
+    bot_app.add_handler(CommandHandler("list", show_list))
+    bot_app.add_handler(CommandHandler("clear", clear_list))
+    bot_app.add_handler(CallbackQueryHandler(button_handler))
 
-    # Запуск Flask в отдельном потоке
-    threading.Thread(target=lambda: flask_app.run(host="0.0.0.0", port=PORT)).start()
+    # Сохраняем ссылку на bot_app в Flask-приложении
+    flask_app.bot_app = bot_app
+
+    # Устанавливаем webhook и запускаем бота в фоне
+    import asyncio
+    from threading import Thread
+
+    def run_bot():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+        # Устанавливаем webhook
+        webhook_url = f"https://{os.environ['RENDER_EXTERNAL_HOSTNAME']}/{TOKEN}"
+        loop.run_until_complete(bot_app.bot.set_webhook(url=webhook_url))
+        logging.info(f"Webhook установлен на: {webhook_url}")
+
+        # Запускаем polling в фоне (на самом деле webhook обрабатывает всё)
+        bot_app.run_polling(close_loop=False)
+
+    # Запускаем бота в отдельном потоке
+    Thread(target=run_bot, daemon=True).start()
+
+    # Запускаем Flask
+    flask_app.run(host="0.0.0.0", port=PORT)
 
 if __name__ == '__main__':
     main()
