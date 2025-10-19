@@ -1,6 +1,6 @@
 import logging
 import os
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -10,11 +10,13 @@ from telegram.ext import (
 import gspread
 from google.oauth2.service_account import Credentials
 import json
+from flask import Flask, request
 
 # === НАСТРОЙКИ ===
 TOKEN = os.environ["TELEGRAM_TOKEN"]
 SHEET_ID = os.environ["GOOGLE_SHEET_ID"]
 CREDENTIALS_JSON = os.environ["GOOGLE_CREDENTIALS_JSON"]
+PORT = int(os.environ.get("PORT", 10000))  # Render задаёт PORT автоматически
 
 # === GOOGLE AUTH ===
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
@@ -30,7 +32,6 @@ logging.basicConfig(
 )
 
 # === ФУНКЦИИ РАБОТЫ С ТАБЛИЦЕЙ ===
-
 def get_worksheet(chat_id: int):
     try:
         return sheet.worksheet(str(chat_id))
@@ -51,7 +52,6 @@ def remove_item_from_sheet(chat_id: int, index: int):
     ws.delete_rows(index + 2)
 
 # === ОБРАБОТЧИКИ ===
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🛒 Бот для закупок\n\n"
@@ -77,6 +77,7 @@ async def show_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not items:
         await update.message.reply_text("Список пуст 🛒")
         return
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
     keyboard = [[InlineKeyboardButton(f"✅ Куплено: {item}", callback_data=f"remove_{i}")]
                 for i, item in enumerate(items)]
     await update.message.reply_text("Список закупок:", reply_markup=InlineKeyboardMarkup(keyboard))
@@ -107,8 +108,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logging.error("Ошибка: %s", e)
             await query.edit_message_text("Ошибка удаления.")
 
-# === ЗАПУСК ===
-
+# === ЗАПУСК С WEBHOOK ===
 def main():
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
@@ -116,7 +116,28 @@ def main():
     app.add_handler(CommandHandler("list", show_list))
     app.add_handler(CommandHandler("clear", clear_list))
     app.add_handler(CallbackQueryHandler(button_handler))
-    app.run_polling()
+
+    # Flask для обработки webhook
+    flask_app = Flask(__name__)
+
+    @flask_app.route(f"/{TOKEN}", methods=["POST"])
+    def webhook():
+        app.update_queue.put_nowait(
+            Update.de_json(request.get_json(force=True), app.bot)
+        )
+        return "OK"
+
+    @flask_app.route("/")
+    def hello():
+        return "Telegram Purchase Bot is running!"
+
+    # Установка webhook
+    import threading
+    webhook_url = f"https://{os.environ['RENDER_EXTERNAL_HOSTNAME']}/{TOKEN}"
+    app.bot.set_webhook(url=webhook_url)
+
+    # Запуск Flask в отдельном потоке
+    threading.Thread(target=lambda: flask_app.run(host="0.0.0.0", port=PORT)).start()
 
 if __name__ == '__main__':
     main()
