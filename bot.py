@@ -11,7 +11,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 import json
 
-# === НАСТРОЙКИ ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ ===
+# === НАСТРОЙКИ ===
 TOKEN = os.environ["TELEGRAM_TOKEN"]
 SHEET_ID = os.environ["GOOGLE_SHEET_ID"]
 CREDENTIALS_JSON = os.environ["GOOGLE_CREDENTIALS_JSON"]
