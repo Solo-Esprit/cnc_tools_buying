@@ -110,50 +110,41 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # === ГЛАВНАЯ ФУНКЦИЯ ===
 def main():
-    # Создаём Flask-приложение
+    # Создаём Application один раз
+    app = Application.builder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("add", add_item))
+    app.add_handler(CommandHandler("list", show_list))
+    app.add_handler(CommandHandler("clear", clear_list))
+    app.add_handler(CallbackQueryHandler(button_handler))
+
+    # Запускаем Application в фоне (без polling!)
+    app.post_init = lambda *_: logging.info("Application initialized")
+    app.updater = None  # отключаем updater, так как используем webhook
+    app._running = True
+    import asyncio
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    # Устанавливаем webhook
+    webhook_url = f"https://{os.environ['RENDER_EXTERNAL_HOSTNAME']}/{TOKEN}"
+    loop.run_until_complete(app.bot.set_webhook(url=webhook_url))
+    logging.info(f"✅ Webhook установлен: {webhook_url}")
+
+    # Flask-сервер
     flask_app = Flask(__name__)
 
     @flask_app.route(f"/{TOKEN}", methods=["POST"])
     def telegram_webhook():
-        # Передаём обновление в очередь бота
-        flask_app.bot_app.update_queue.put_nowait(
-            Update.de_json(request.get_json(force=True), flask_app.bot_app.bot)
-        )
+        # Получаем JSON от Telegram
+        update = Update.de_json(request.get_json(force=True), app.bot)
+        # Обрабатываем асинхронно
+        loop.create_task(app.process_update(update))
         return "OK"
 
     @flask_app.route("/")
     def hello():
-        return "Telegram Purchase Bot is running!"
-
-    # Инициализация Telegram-бота
-    bot_app = Application.builder().token(TOKEN).build()
-    bot_app.add_handler(CommandHandler("start", start))
-    bot_app.add_handler(CommandHandler("add", add_item))
-    bot_app.add_handler(CommandHandler("list", show_list))
-    bot_app.add_handler(CommandHandler("clear", clear_list))
-    bot_app.add_handler(CallbackQueryHandler(button_handler))
-
-    # Сохраняем ссылку на bot_app в Flask-приложении
-    flask_app.bot_app = bot_app
-
-    # Устанавливаем webhook и запускаем бота в фоне
-    import asyncio
-    from threading import Thread
-
-    def run_bot():
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-
-        # Устанавливаем webhook
-        webhook_url = f"https://{os.environ['RENDER_EXTERNAL_HOSTNAME']}/{TOKEN}"
-        loop.run_until_complete(bot_app.bot.set_webhook(url=webhook_url))
-        logging.info(f"Webhook установлен на: {webhook_url}")
-
-        # Запускаем polling в фоне (на самом деле webhook обрабатывает всё)
-        bot_app.run_polling(close_loop=False)
-
-    # Запускаем бота в отдельном потоке
-    Thread(target=run_bot, daemon=True).start()
+        return "🛒 Telegram Purchase Bot is running!"
 
     # Запускаем Flask
     flask_app.run(host="0.0.0.0", port=PORT)
