@@ -97,7 +97,7 @@ class GoogleSheetsManager:
                 new_row_value = f"{item} ({new_quantity})" if new_quantity > 1 else item
                 # Обновляем ячейку (строка = индекс + 2, т.к. A1 = заголовок)
                 cell = f"A{existing_index + 2}"
-                ws.update(cell, [new_row_value])
+                ws.update(cell, [[new_row_value]])  # ✅ Исправлено: двойной список
                 logging.info("🔄 Обновлена позиция: чат %s, '%s' -> '%s'", chat_id, items[existing_index], new_row_value)
             else:
                 # Добавляем новую строку
@@ -331,3 +331,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
