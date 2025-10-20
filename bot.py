@@ -16,6 +16,7 @@ from flask import Flask, request
 import asyncio
 import threading
 import queue
+import re
 
 # === НАСТРОЙКИ ===
 TOKEN = os.environ["TELEGRAM_TOKEN"]
@@ -59,7 +60,7 @@ class GoogleSheetsManager:
                 logging.info("🆕 Создан лист для чата %s", chat_id)
                 return ws
             except Exception as e:
-                logging.error("💥 Не удалось создать лист для чата %s: %s", chat_id, e, exc_info=True)
+                logging.error("💥 Не удалось создить лист для чата %s: %s", chat_id, e, exc_info=True)
                 raise
         except Exception as e:
             logging.error("💥 Ошибка доступа к таблице при получении листа %s: %s", chat_id, e, exc_info=True)
@@ -75,12 +76,34 @@ class GoogleSheetsManager:
             logging.error("💥 Ошибка получения списка для чата %s: %s", chat_id, e, exc_info=True)
             return []
 
-    def add_item(self, chat_id: int, item: str):
+    def add_item(self, chat_id: int, item: str, quantity: int = 1):
         try:
-            start = time.perf_counter()
             ws = self.get_worksheet(chat_id)
-            ws.append_row([item])
-            logging.info("✅ Запись в Google Таблицу: чат %s, артикул '%s' (время: %.2fс)", chat_id, item, time.perf_counter() - start)
+            # Проверяем, есть ли уже такой артикул (без количества)
+            items = self.get_items(chat_id)
+            existing_index = None
+            existing_quantity = 0
+            for i, row in enumerate(items):
+                # Извлекаем артикул и количество из строки "Артикул (N)"
+                parsed_item, parsed_qty = self._parse_item(row)
+                if parsed_item == item:
+                    existing_index = i
+                    existing_quantity = parsed_qty
+                    break
+
+            if existing_index is not None:
+                # Обновляем строку: складываем количество
+                new_quantity = existing_quantity + quantity
+                new_row_value = f"{item} ({new_quantity})" if new_quantity > 1 else item
+                # Обновляем ячейку (строка = индекс + 2, т.к. A1 = заголовок)
+                cell = f"A{existing_index + 2}"
+                ws.update(cell, [new_row_value])
+                logging.info("🔄 Обновлена позиция: чат %s, '%s' -> '%s'", chat_id, items[existing_index], new_row_value)
+            else:
+                # Добавляем новую строку
+                row_value = f"{item} ({quantity})" if quantity > 1 else item
+                ws.append_row([row_value])
+                logging.info("✅ Запись в Google Таблицу: чат %s, '%s'", chat_id, row_value)
         except Exception as e:
             logging.error("💥 Ошибка записи в Google Таблицу для чата %s: %s", chat_id, e, exc_info=True)
             raise
@@ -95,6 +118,17 @@ class GoogleSheetsManager:
             logging.error("💥 Ошибка удаления из таблицы для чата %s: %s", chat_id, e, exc_info=True)
             raise
 
+    def _parse_item(self, row: str):
+        """Извлекает артикул и количество из строки 'Артикул (N)' или 'Артикул'"""
+        match = re.match(r'^(.+?)\s*\((\d+)\)\s*$', row.strip())
+        if match:
+            item = match.group(1).strip()
+            quantity = int(match.group(2))
+            return item, quantity
+        else:
+            return row.strip(), 1
+
+
 # === ИНИЦИАЛИЗАЦИЯ МЕНЕДЖЕРА ===
 gs_manager = GoogleSheetsManager(SHEET_ID, CREDENTIALS_JSON)
 
@@ -105,7 +139,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🛒 Бот для закупок\n\n"
         "Команды:\n"
-        "/add <артикул> — добавить\n"
+        "/add <артикул> (кол-во) — добавить (например: /add Ключ 10мм (5) или /add 12345-KEY (2))\n"
         "/list — показать список\n"
         "/clear — очистить\n"
         "/stats — статистика\n"
@@ -116,7 +150,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "ℹ️ Помощь по боту:\n\n"
         "/start — приветствие\n"
-        "/add <артикул> — добавить позицию\n"
+        "/add <артикул> (кол-во) — добавить позицию (например: /add Ключ 10мм (5))\n"
         "/list — показать список\n"
         "/clear — очистить список\n"
         "/stats — статистика\n"
@@ -126,7 +160,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     items = gs_manager.get_items(chat_id)
-    await update.message.reply_text(f"📊 Всего позиций в списке: {len(items)}")
+    total_items = sum(gs_manager._parse_item(item)[1] for item in items)
+    await update.message.reply_text(f"📊 Всего позиций в списке: {len(items)}\n"
+                                    f"📦 Общее количество: {total_items}")
 
 async def add_item(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -134,22 +170,30 @@ async def add_item(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     logging.info("📥 /add от %s в чате %s: args=%s", user.id, chat_id, args)
     if not args:
-        await update.message.reply_text("UsageId: /add <артикул>")
-        return
-    item = " ".join(args).strip()
-    if not item:
-        await update.message.reply_text("Артикул не может быть пустым.")
+        await update.message.reply_text("UsageId: /add <артикул> (кол-во)\nПример: /add Ключ 10мм (5)")
         return
 
-    # Проверка на дубликат
-    items = gs_manager.get_items(chat_id)
-    if item in items:
-        await update.message.reply_text(f"⚠️ Артикул '{item}' уже в списке.")
-        return
+    full_text = " ".join(args)
+    # Ищем паттерн " (N)" в конце строки
+    match = re.search(r'\s*\((\d+)\)\s*$', full_text)
+    if match:
+        quantity_str = match.group(1)
+        quantity = int(quantity_str)
+        item = full_text[:match.start()].strip() # текст до "(N)"
+        if not item:
+            await update.message.reply_text("Артикул не может быть пустым.")
+            return
+    else:
+        quantity = 1
+        item = full_text.strip()
+        if not item:
+            await update.message.reply_text("Артикул не может быть пустым.")
+            return
 
     try:
-        gs_manager.add_item(chat_id, item)
-        await update.message.reply_text(f"✅ Добавлено: {item}")
+        gs_manager.add_item(chat_id, item, quantity)
+        formatted_item = f"{item} ({quantity})" if quantity > 1 else item
+        await update.message.reply_text(f"✅ Добавлено: {formatted_item}")
     except gspread.exceptions.APIError:
         await update.message.reply_text("❌ Ошибка Google API. Проверьте права доступа.")
     except Exception as e:
