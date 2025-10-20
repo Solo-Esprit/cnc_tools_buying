@@ -1,5 +1,7 @@
 import logging
 import os
+import time
+from typing import List, Optional
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -26,10 +28,6 @@ SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive"  # Обязательно для add_worksheet!
 ]
-creds_dict = json.loads(CREDENTIALS_JSON)
-credentials = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
-gc = gspread.authorize(credentials)
-sheet = gc.open_by_key(SHEET_ID)
 
 # === ЛОГИРОВАНИЕ ===
 logging.basicConfig(
@@ -37,54 +35,70 @@ logging.basicConfig(
     level=logging.INFO
 )
 
-# === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ С ЛОГИРОВАНИЕМ ОШИБОК ===
+# === КЛАСС ДЛЯ РАБОТЫ С GOOGLE ТАБЛИЦЕЙ ===
+class GoogleSheetsManager:
+    def __init__(self, sheet_id: str, credentials_json: str):
+        creds_dict = json.loads(credentials_json)
+        credentials = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
+        gc = gspread.authorize(credentials)
+        self.sheet = gc.open_by_key(sheet_id)
+        self._worksheet_cache = {}  # кэш для листов
 
-def get_worksheet(chat_id: int):
-    try:
-        return sheet.worksheet(str(chat_id))
-    except gspread.WorksheetNotFound:
+    def get_worksheet(self, chat_id: int):
+        if chat_id in self._worksheet_cache:
+            return self._worksheet_cache[chat_id]
         try:
-            ws = sheet.add_worksheet(title=str(chat_id), rows="100", cols="2")
-            ws.update('A1', 'Артикул')
-            logging.info("🆕 Создан лист для чата %s", chat_id)
+            ws = self.sheet.worksheet(str(chat_id))
+            self._worksheet_cache[chat_id] = ws
             return ws
+        except gspread.WorksheetNotFound:
+            try:
+                ws = self.sheet.add_worksheet(title=str(chat_id), rows="100", cols="2")
+                ws.update('A1', 'Артикул')
+                self._worksheet_cache[chat_id] = ws
+                logging.info("🆕 Создан лист для чата %s", chat_id)
+                return ws
+            except Exception as e:
+                logging.error("💥 Не удалось создать лист для чата %s: %s", chat_id, e, exc_info=True)
+                raise
         except Exception as e:
-            logging.error("💥 Не удалось создать лист для чата %s: %s", chat_id, e, exc_info=True)
+            logging.error("💥 Ошибка доступа к таблице при получении листа %s: %s", chat_id, e, exc_info=True)
             raise
-    except Exception as e:
-        logging.error("💥 Ошибка доступа к таблице при получении листа %s: %s", chat_id, e, exc_info=True)
-        raise
 
-def get_items(chat_id: int):
-    try:
-        ws = get_worksheet(chat_id)
-        items = [item for item in ws.col_values(1)[1:] if item.strip()]
-        logging.info("📋 Получено %d позиций для чата %s", len(items), chat_id)
-        return items
-    except Exception as e:
-        logging.error("💥 Ошибка получения списка для чата %s: %s", chat_id, e, exc_info=True)
-        return []
+    def get_items(self, chat_id: int) -> List[str]:
+        try:
+            ws = self.get_worksheet(chat_id)
+            items = [item for item in ws.col_values(1)[1:] if item.strip()]
+            logging.info("📋 Получено %d позиций для чата %s", len(items), chat_id)
+            return items
+        except Exception as e:
+            logging.error("💥 Ошибка получения списка для чата %s: %s", chat_id, e, exc_info=True)
+            return []
 
-def add_item_to_sheet(chat_id: int, item: str):
-    try:
-        ws = get_worksheet(chat_id)
-        ws.append_row([item])
-        logging.info("✅ Запись в Google Таблицу: чат %s, артикул '%s'", chat_id, item)
-    except Exception as e:
-        logging.error("💥 Ошибка записи в Google Таблицу для чата %s: %s", chat_id, e, exc_info=True)
-        raise
+    def add_item(self, chat_id: int, item: str):
+        try:
+            start = time.perf_counter()
+            ws = self.get_worksheet(chat_id)
+            ws.append_row([item])
+            logging.info("✅ Запись в Google Таблицу: чат %s, артикул '%s' (время: %.2fс)", chat_id, item, time.perf_counter() - start)
+        except Exception as e:
+            logging.error("💥 Ошибка записи в Google Таблицу для чата %s: %s", chat_id, e, exc_info=True)
+            raise
 
-def remove_item_from_sheet(chat_id: int, index: int):
-    try:
-        ws = get_worksheet(chat_id)
-        ws.delete_rows(index + 2)
-        logging.info("🗑️ Удалена позиция %d из чата %s", index, chat_id)
-    except Exception as e:
-        logging.error("💥 Ошибка удаления из таблицы для чата %s: %s", chat_id, e, exc_info=True)
-        raise
+    def remove_item(self, chat_id: int, index: int):
+        try:
+            start = time.perf_counter()
+            ws = self.get_worksheet(chat_id)
+            ws.delete_rows(index + 2)
+            logging.info("🗑️ Удалена позиция %d из чата %s (время: %.2fс)", index, chat_id, time.perf_counter() - start)
+        except Exception as e:
+            logging.error("💥 Ошибка удаления из таблицы для чата %s: %s", chat_id, e, exc_info=True)
+            raise
+
+# === ИНИЦИАЛИЗАЦИЯ МЕНЕДЖЕРА ===
+gs_manager = GoogleSheetsManager(SHEET_ID, CREDENTIALS_JSON)
 
 # === ОБРАБОТЧИКИ ===
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     logging.info("✅ Обработчик /start вызван для %s", user.id)
@@ -93,8 +107,26 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Команды:\n"
         "/add <артикул> — добавить\n"
         "/list — показать список\n"
-        "/clear — очистить"
+        "/clear — очистить\n"
+        "/stats — статистика\n"
+        "/help — помощь"
     )
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "ℹ️ Помощь по боту:\n\n"
+        "/start — приветствие\n"
+        "/add <артикул> — добавить позицию\n"
+        "/list — показать список\n"
+        "/clear — очистить список\n"
+        "/stats — статистика\n"
+        "/help — это сообщение"
+    )
+
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    items = gs_manager.get_items(chat_id)
+    await update.message.reply_text(f"📊 Всего позиций в списке: {len(items)}")
 
 async def add_item(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -108,17 +140,26 @@ async def add_item(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not item:
         await update.message.reply_text("Артикул не может быть пустым.")
         return
+
+    # Проверка на дубликат
+    items = gs_manager.get_items(chat_id)
+    if item in items:
+        await update.message.reply_text(f"⚠️ Артикул '{item}' уже в списке.")
+        return
+
     try:
-        add_item_to_sheet(chat_id, item)
+        gs_manager.add_item(chat_id, item)
         await update.message.reply_text(f"✅ Добавлено: {item}")
+    except gspread.exceptions.APIError:
+        await update.message.reply_text("❌ Ошибка Google API. Проверьте права доступа.")
     except Exception as e:
-        await update.message.reply_text("❌ Ошибка при добавлении в таблицу. Проверьте настройки Google.")
+        await update.message.reply_text("❌ Неизвестная ошибка. Попробуйте позже.")
         logging.error("Ошибка в /add: %s", e)
 
 async def show_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     try:
-        items = get_items(chat_id)
+        items = gs_manager.get_items(chat_id)
         if not items:
             await update.message.reply_text("Список пуст 🛒")
             return
@@ -133,7 +174,7 @@ async def show_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def clear_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     try:
-        ws = get_worksheet(chat_id)
+        ws = gs_manager.get_worksheet(chat_id)
         rows = len(ws.col_values(1))
         if rows > 1:
             ws.delete_rows(2, rows)
@@ -151,9 +192,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("remove_"):
         try:
             index = int(data.split("_")[1])
-            items = get_items(chat_id)
+            items = gs_manager.get_items(chat_id)
             if 0 <= index < len(items):
-                remove_item_from_sheet(chat_id, index)
+                gs_manager.remove_item(chat_id, index)
                 await query.edit_message_text(f"✅ Убрано: {items[index]}")
             else:
                 await query.edit_message_text("Позиция уже удалена.")
@@ -170,9 +211,11 @@ async def telegram_worker():
     global bot_instance
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("add", add_item))
     app.add_handler(CommandHandler("list", show_list))
     app.add_handler(CommandHandler("clear", clear_list))
+    app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CallbackQueryHandler(button_handler))
 
     await app.initialize()
@@ -181,8 +224,12 @@ async def telegram_worker():
     logging.info("✅ Telegram worker запущен")
 
     # Устанавливаем webhook
+    hostname = os.environ.get('RENDER_EXTERNAL_HOSTNAME')
+    if not hostname:
+        logging.error("❌ RENDER_EXTERNAL_HOSTNAME не установлено!")
+        return
     BOT_ID = TOKEN.split(':')[0]
-    webhook_url = f"https://{os.environ['RENDER_EXTERNAL_HOSTNAME']}/webhook-{BOT_ID}"
+    webhook_url = f"https://{hostname}/webhook-{BOT_ID}"
     await app.bot.set_webhook(url=webhook_url)
     logging.info(f"✅ Webhook установлен: {webhook_url}")
 
